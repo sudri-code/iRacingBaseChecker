@@ -4,11 +4,12 @@ using HidSharp;
 using Vortice.DirectInput;
 
 // Spike для этапа 0: снять главный технический риск проекта до того, как строить
-// архитектуру и UI. Проверяем четыре вещи на живом железе:
-//   1. DirectInput даёт Exclusive|Background и создаёт ConstantForce.
-//   2. Позиция оси читается ПАРАЛЛЕЛЬНО с удержанием exclusive-режима.
-//   3. Сколько стоит сам вызов SetParameters (он войдёт в измеряемую задержку).
-//   4. Виден ли вообще step response — то есть жизнеспособна ли методика.
+// архитектуру и UI. Проверяем на живом железе:
+//   1. DirectInput даёт Exclusive|Background и позволяет Acquire.
+//   2. Какая ось на самом деле рулевая и с какой частотой она обновляется.
+//   3. Позиция оси читается ПАРАЛЛЕЛЬНО с удержанием exclusive-режима.
+//   4. Сколько стоит вызов SetParameters (он войдёт в измеряемую задержку).
+//   5. Виден ли step response — то есть жизнеспособна ли методика.
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 Console.WriteLine("=== FFB Latency Spike — проверка осуществимости замера ===\n");
@@ -22,6 +23,7 @@ if (!OperatingSystem.IsWindows())
 IDirectInput8? directInput = null;
 IDirectInputDevice8? device = null;
 IDirectInputEffect? effect = null;
+HiddenWindow? window = null;
 bool autoCenterChanged = false;
 
 try
@@ -40,38 +42,31 @@ try
 
     Console.WriteLine("Найденные устройства:");
     for (int i = 0; i < instances.Count; i++)
-    {
-        var inst = instances[i];
-        Console.WriteLine($"  [{i}] {inst.ProductName}  (instance: {inst.InstanceName})");
-    }
+        Console.WriteLine($"  [{i}] {instances[i].ProductName}  (instance: {instances[i].InstanceName})");
 
-    int index = AskIndex(instances.Count);
-    var chosen = instances[index];
+    var chosen = instances[AskIndex(instances.Count)];
     Console.WriteLine($"\nВыбрано: {chosen.ProductName}");
 
     device = directInput.CreateDevice(chosen.InstanceGuid);
     device.SetDataFormat<RawJoystickState>();
 
-    var hwnd = Native.GetOwnerWindow();
-    Console.WriteLine($"HWND консоли: 0x{hwnd:X}");
+    // Окно обязано принадлежать нашему процессу — см. комментарий в HiddenWindow.
+    window = new HiddenWindow();
+    Console.WriteLine($"Создано собственное скрытое окно: 0x{window.Handle:X}");
 
-    // Exclusive обязателен для FFB, Background — чтобы замер не ломался при потере фокуса.
-    var coop = device.SetCooperativeLevel(hwnd, CooperativeLevel.Exclusive | CooperativeLevel.Background);
+    var coop = device.SetCooperativeLevel(window.Handle, CooperativeLevel.Exclusive | CooperativeLevel.Background);
     Console.WriteLine($"SetCooperativeLevel(Exclusive|Background): {Describe(coop)}");
-    if (coop.Failure)
-    {
-        Console.WriteLine("  → Не удалось получить exclusive-режим. Закройте SimHub / iRacing / софт базы и повторите.");
-        return 1;
-    }
+    if (coop.Failure) return 1;
 
     // ── Шаг 2. Свойства устройства ────────────────────────────────────────────
     var caps = device.Capabilities;
     Console.WriteLine("\n--- Возможности устройства ---");
     Console.WriteLine($"  Оси: {caps.AxeCount}, кнопки: {caps.ButtonCount}");
     Console.WriteLine($"  ForceFeedback: {caps.Flags.HasFlag(DeviceFlags.ForceFeedback)}");
-    Console.WriteLine($"  FFB sample period:          {caps.ForceFeedbackSamplePeriod} мкс");
-    Console.WriteLine($"  FFB min time resolution:    {caps.ForceFeedbackMinimumTimeResolution} мкс");
-    Console.WriteLine($"  Firmware rev: {caps.FirmwareRevision}, driver: {caps.DriverVersion}");
+    Console.WriteLine($"  FFB sample period: {caps.ForceFeedbackSamplePeriod} мкс, " +
+                      $"min time resolution: {caps.ForceFeedbackMinimumTimeResolution} мкс");
+    if (caps.ForceFeedbackSamplePeriod >= 1_000_000)
+        Console.WriteLine("    (1 с — это значение-заглушка драйвера, а не характеристика базы)");
 
     if (!caps.Flags.HasFlag(DeviceFlags.ForceFeedback))
     {
@@ -82,41 +77,37 @@ try
     var props = device.Properties;
     int vid = 0, pid = 0;
     string? interfacePath = null;
-    try
-    {
-        vid = props.VendorId;
-        pid = props.ProductId;
-        interfacePath = props.InterfacePath;
-        Console.WriteLine($"  VID/PID: {vid:X4}:{pid:X4}");
-    }
-    catch (Exception ex) { Console.WriteLine($"  (VID/PID недоступны: {ex.Message})"); }
+
+    TryRead("VID/PID", () => { vid = props.VendorId; pid = props.ProductId; return $"{vid:X4}:{pid:X4}"; });
+    TryRead("Interface path", () => { interfacePath = props.InterfacePath; return interfacePath ?? "?"; });
+    TryRead("Диапазон оси", () => { var r = props.Range; return $"{r.Minimum}..{r.Maximum}"; });
 
     // Автоцентр — это пружина, она исказит step response. Обязательно выключить.
     try
     {
         props.AutoCenter = false;
         autoCenterChanged = true;
-        Console.WriteLine("  AutoCenter выключен.");
+        Console.WriteLine("  AutoCenter: выключен");
     }
-    catch (Exception ex) { Console.WriteLine($"  AutoCenter выключить не удалось: {ex.Message}"); }
-
-    // Расширяем логический диапазон оси — больше отсчётов, тоньше детект движения.
-    try
-    {
-        props.Range = new InputRange(-32768, 32767);
-        var r = props.Range;
-        Console.WriteLine($"  Диапазон оси: {r.Minimum}..{r.Maximum}");
-    }
-    catch (Exception ex) { Console.WriteLine($"  Диапазон задать не удалось: {ex.Message}"); }
+    catch (Exception ex) { Console.WriteLine($"  AutoCenter выключить не удалось: {Brief(ex)}"); }
 
     try { props.ForceFeedbackGain = 10000; } catch { /* не критично */ }
 
     var acq = device.Acquire();
     Console.WriteLine($"Acquire: {Describe(acq)}");
-    if (acq.Failure) return 1;
+    if (acq.Failure)
+    {
+        Console.WriteLine("  → Устройство не захвачено. Закройте Pit House / SimPro Manager / SimHub / iRacing.");
+        return 1;
+    }
 
-    // ── Шаг 3. Фактическая частота обновления оси ─────────────────────────────
-    MeasureAxisUpdateRate(device);
+    // ── Шаг 3. Какая ось рулевая и как часто обновляется ──────────────────────
+    var axis = DetectSteeringAxis(device);
+    if (axis is null)
+    {
+        Console.WriteLine("Рулевую ось определить не удалось — руль почти не двигался.");
+        return 1;
+    }
 
     // ── Шаг 4. Создание эффекта ───────────────────────────────────────────────
     var effectParams = new EffectParameters
@@ -125,18 +116,16 @@ try
         Duration = unchecked((int)0xFFFFFFFF), // INFINITE
         SamplePeriod = 0,
         Gain = 10000,
-        TriggerButton = -1,                    // без триггера
+        TriggerButton = -1,
         TriggerRepeatInterval = unchecked((int)0xFFFFFFFF),
         StartDelay = 0,
         Parameters = new ConstantForce { Magnitude = 0 },
     };
-    effectParams.SetAxes(new[] { (int)JoystickOffset.X }, new[] { 0 });
+    effectParams.SetAxes(new[] { (int)axis.Offset }, new[] { 0 });
 
     effect = device.CreateEffect(EffectGuid.ConstantForce, effectParams);
-    Console.WriteLine("\nConstantForce эффект создан.");
-
-    var startResult = effect.Start(1, EffectPlayFlags.None);
-    Console.WriteLine($"Effect.Start: {Describe(startResult)}");
+    Console.WriteLine($"\nConstantForce эффект создан на оси {axis.Name}.");
+    Console.WriteLine($"Effect.Start: {Describe(effect.Start(1, EffectPlayFlags.None))}");
 
     // ── Шаг 5. Стоимость SetParameters ────────────────────────────────────────
     MeasureSetParametersCost(effect, effectParams);
@@ -145,7 +134,7 @@ try
     Console.WriteLine("\nСейчас будет подаваться усилие ~25% — руль дёрнется.");
     Console.WriteLine("Уберите руки, освободите руль. Enter — продолжить, любая другая клавиша — пропустить.");
     if (Console.ReadKey(true).Key == ConsoleKey.Enter)
-        MeasureStepResponse(device, effect, effectParams);
+        MeasureStepResponse(device, effect, effectParams, axis);
     else
         Console.WriteLine("Step response пропущен.");
 
@@ -171,6 +160,7 @@ finally
         try { device.Dispose(); } catch { }
     }
     try { directInput?.Dispose(); } catch { }
+    window?.Dispose();
     Native.TimeEndPeriod(1);
 }
 
@@ -181,62 +171,146 @@ static int AskIndex(int count)
     while (true)
     {
         Console.Write($"\nНомер устройства [0..{count - 1}]: ");
-        var line = Console.ReadLine();
-        if (int.TryParse(line, out int i) && i >= 0 && i < count) return i;
+        if (int.TryParse(Console.ReadLine(), out int i) && i >= 0 && i < count) return i;
         Console.WriteLine("Не понял, повторите.");
     }
 }
 
-static string Describe(SharpGen.Runtime.Result r) =>
-    r.Success ? "OK" : $"FAILED (0x{r.Code:X8})";
+static void TryRead(string label, Func<string> read)
+{
+    try { Console.WriteLine($"  {label}: {read()}"); }
+    catch (Exception ex) { Console.WriteLine($"  {label}: недоступно ({Brief(ex)})"); }
+}
+
+static string Brief(Exception ex)
+{
+    var line = ex.Message.Split('\n')[0].Trim();
+    return line.Length > 90 ? line[..90] + "…" : line;
+}
+
+static string Describe(SharpGen.Runtime.Result r)
+{
+    if (r.Success) return "OK";
+    string hint = unchecked((uint)r.Code) switch
+    {
+        0x80070578 => " — ERROR_INVALID_WINDOW_HANDLE: окно не принадлежит процессу",
+        0x80070005 => " — доступ запрещён: устройство занято другим приложением",
+        0x8007001E => " — DIERR_INPUTLOST: устройство потеряно",
+        0x80070015 => " — DIERR_NOTINITIALIZED",
+        0x80070057 => " — DIERR_INVALIDPARAM: неверный параметр",
+        _ => "",
+    };
+    return $"FAILED (0x{r.Code:X8}){hint}";
+}
+
+static int ReadAxis(JoystickState s, int index) => index switch
+{
+    0 => s.X,
+    1 => s.Y,
+    2 => s.Z,
+    3 => s.RotationX,
+    4 => s.RotationY,
+    5 => s.RotationZ,
+    6 => s.Sliders is { Length: > 0 } sl ? sl[0] : 0,
+    7 => s.Sliders is { Length: > 1 } sl2 ? sl2[1] : 0,
+    _ => 0,
+};
 
 /// <summary>
-/// Меряет, с какой частотой база реально отдаёт новые значения оси. Значение меняется
-/// только при движении руля, поэтому крутить его должен человек.
+/// Определяет рулевую ось по фактическому размаху при вращении и заодно меряет,
+/// с какой частотой база отдаёт новые значения.
 /// </summary>
-static void MeasureAxisUpdateRate(IDirectInputDevice8 device)
+/// <remarks>
+/// У базы восемь осей, и считать рулевой именно X — предположение, которое дёшево
+/// проверить и дорого не заметить: эффект, привязанный не к той оси, просто не даст отклика.
+/// </remarks>
+static AxisDef? DetectSteeringAxis(IDirectInputDevice8 device)
 {
-    Console.WriteLine("\n--- Частота обновления оси ---");
-    Console.WriteLine("Плавно покрутите руль туда-сюда 5 секунд. Enter — старт.");
+    var all = new[]
+    {
+        new AxisDef("X", JoystickOffset.X, 0),
+        new AxisDef("Y", JoystickOffset.Y, 1),
+        new AxisDef("Z", JoystickOffset.Z, 2),
+        new AxisDef("RotationX", JoystickOffset.RotationX, 3),
+        new AxisDef("RotationY", JoystickOffset.RotationY, 4),
+        new AxisDef("RotationZ", JoystickOffset.RotationZ, 5),
+        new AxisDef("Slider0", JoystickOffset.Sliders0, 6),
+        new AxisDef("Slider1", JoystickOffset.Sliders1, 7),
+    };
+
+    Console.WriteLine("\n--- Рулевая ось и частота обновления ---");
+    Console.WriteLine("Плавно покрутите руль влево-вправо примерно на пол-оборота. Enter — старт (5 секунд).");
     Console.ReadLine();
 
+    var min = new int[all.Length];
+    var max = new int[all.Length];
     var state = new JoystickState();
-    var intervals = new List<double>(20000);
     long freq = Stopwatch.Frequency;
-    long deadline = Stopwatch.GetTimestamp() + freq * 5;
 
     device.Poll();
     device.GetCurrentJoystickState(ref state);
-    int lastValue = state.X;
+    for (int a = 0; a < all.Length; a++) min[a] = max[a] = ReadAxis(state, a);
+
+    var intervals = new List<double>(30000);
+    int previous = ReadAxis(state, 0);
     long lastChange = Stopwatch.GetTimestamp();
+    long deadline = lastChange + freq * 5;
     int changes = 0;
+    int steeringGuess = 0;
 
     while (Stopwatch.GetTimestamp() < deadline)
     {
         device.Poll();
         device.GetCurrentJoystickState(ref state);
-        if (state.X != lastValue)
+
+        for (int a = 0; a < all.Length; a++)
+        {
+            int v = ReadAxis(state, a);
+            if (v < min[a]) min[a] = v;
+            if (v > max[a]) max[a] = v;
+        }
+
+        // Частоту меряем по оси с наибольшим размахом на текущий момент.
+        int best = 0;
+        for (int a = 1; a < all.Length; a++)
+            if (max[a] - min[a] > max[best] - min[best]) best = a;
+        steeringGuess = best;
+
+        int current = ReadAxis(state, best);
+        if (current != previous)
         {
             long now = Stopwatch.GetTimestamp();
             intervals.Add((now - lastChange) * 1000.0 / freq);
             lastChange = now;
-            lastValue = state.X;
+            previous = current;
             changes++;
         }
     }
 
-    if (changes < 20)
+    Console.WriteLine("  Размах по осям:");
+    for (int a = 0; a < all.Length; a++)
     {
-        Console.WriteLine($"  Зафиксировано всего {changes} изменений — руль почти не двигался, замер недостоверен.");
-        return;
+        int span = max[a] - min[a];
+        if (span > 0)
+            Console.WriteLine($"    {all[a].Name,-10} {min[a],7}..{max[a],-7} размах {span}");
     }
+
+    if (max[steeringGuess] - min[steeringGuess] < 100 || changes < 20)
+    {
+        Console.WriteLine($"  Движения почти не было (изменений {changes}) — определить ось нельзя.");
+        return null;
+    }
+
+    var axis = all[steeringGuess];
+    Console.WriteLine($"  → рулевая ось: {axis.Name}, наблюдаемый диапазон {min[steeringGuess]}..{max[steeringGuess]}");
 
     intervals.Sort();
     double median = intervals[intervals.Count / 2];
-    Console.WriteLine($"  Изменений: {changes}");
-    Console.WriteLine($"  Интервал между отсчётами: медиана {median:F3} мс, p5 {Percentile(intervals, 5):F3}, p95 {Percentile(intervals, 95):F3}");
-    Console.WriteLine($"  → эффективная частота ≈ {1000.0 / median:F0} Гц");
-    Console.WriteLine("  (ожидается ~1000 Гц; заметно меньше — USB polling базы ниже, это войдёт в задержку)");
+    Console.WriteLine($"  Изменений: {changes}, интервал между отсчётами: медиана {median:F3} мс, " +
+                      $"p5 {Percentile(intervals, 5):F3}, p95 {Percentile(intervals, 95):F3}");
+    Console.WriteLine($"  → эффективная частота ≈ {1000.0 / median:F0} Гц (ожидается ~1000)");
+
+    return axis;
 }
 
 /// <summary>
@@ -270,15 +344,15 @@ static void MeasureSetParametersCost(IDirectInputEffect effect, EffectParameters
 
     costs.Sort();
     Console.WriteLine($"  медиана {costs[costs.Count / 2]:F4} мс, p95 {Percentile(costs, 95):F4} мс, max {costs[^1]:F4} мс");
-    Console.WriteLine("  (если медиана заметно больше ~0.05 мс — вызов блокирующий, поправка обязательна)");
+    Console.WriteLine("  (медиана заметно больше ~0.05 мс — вызов блокирующий, нужна поправка)");
 }
 
 /// <summary>
 /// Грубый step response: подать ступеньку и засечь, через сколько ось стронется.
-/// Это ещё не измерительная методика из плана (без параболической экстраполяции),
-/// а проверка того, что сигнал вообще виден и порядок величины разумный.
+/// Это ещё не измерительная методика (без параболической экстраполяции),
+/// а проверка того, что сигнал виден и порядок величины разумный.
 /// </summary>
-static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect effect, EffectParameters p)
+static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect effect, EffectParameters p, AxisDef axis)
 {
     Console.WriteLine("\n--- Step response (грубо, 20 повторов) ---");
     const int repeats = 20;
@@ -294,7 +368,6 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
         // Знак чередуем, иначе руль за несколько повторов уедет в упор.
         int mag = (rep % 2 == 0) ? magnitude : -magnitude;
 
-        // Покой: оцениваем шум позиции.
         force.Magnitude = 0;
         p.Parameters = force;
         effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
@@ -302,7 +375,7 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
 
         device.Poll();
         device.GetCurrentJoystickState(ref state);
-        int baseline = state.X;
+        int baseline = ReadAxis(state, axis.Index);
 
         int noise = 0;
         long noiseDeadline = Stopwatch.GetTimestamp() + freq / 10; // 100 мс
@@ -310,11 +383,10 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
         {
             device.Poll();
             device.GetCurrentJoystickState(ref state);
-            noise = Math.Max(noise, Math.Abs(state.X - baseline));
+            noise = Math.Max(noise, Math.Abs(ReadAxis(state, axis.Index) - baseline));
         }
         int threshold = Math.Max(noise * 3, 2);
 
-        // Ступенька.
         force.Magnitude = mag;
         p.Parameters = force;
 
@@ -327,7 +399,7 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
         {
             device.Poll();
             device.GetCurrentJoystickState(ref state);
-            if (Math.Abs(state.X - baseline) > threshold) { detected = Stopwatch.GetTimestamp(); break; }
+            if (Math.Abs(ReadAxis(state, axis.Index) - baseline) > threshold) { detected = Stopwatch.GetTimestamp(); break; }
         }
 
         force.Magnitude = 0;
@@ -366,19 +438,23 @@ static void ProbeParallelHidRead(int vid, int pid, string? interfacePath)
 {
     Console.WriteLine("\n--- Параллельное чтение raw HID ---");
 
-    if (vid == 0 && pid == 0)
+    if (vid == 0)
     {
-        Console.WriteLine("  VID/PID неизвестны — пропускаем.");
+        Console.WriteLine("  VID неизвестен — пропускаем.");
         return;
     }
 
-    var candidates = DeviceList.Local.GetHidDevices(vid, pid).ToList();
-    Console.WriteLine($"  HID-устройств с VID/PID {vid:X4}:{pid:X4}: {candidates.Count}");
+    // Некоторые базы сообщают PID как 0000, поэтому фильтруем только по VID.
+    var candidates = DeviceList.Local.GetHidDevices(vendorID: vid).ToList();
+    Console.WriteLine($"  HID-устройств с VID {vid:X4}: {candidates.Count}" + (pid == 0 ? " (PID не сообщён, фильтр только по VID)" : ""));
 
     foreach (var hid in candidates)
     {
         string path = SafePath(hid);
-        Console.Write($"  → {path}: ");
+        bool matchesDirectInput = interfacePath is not null &&
+            string.Equals(TryDevicePath(hid), interfacePath, StringComparison.OrdinalIgnoreCase);
+
+        Console.Write($"  → {path}{(matchesDirectInput ? "  [то же устройство, что в DirectInput]" : "")}: ");
         try
         {
             if (!hid.TryOpen(out var stream))
@@ -394,7 +470,7 @@ static void ProbeParallelHidRead(int vid, int pid, string? interfacePath)
 
                 int reports = 0;
                 long freq = Stopwatch.Frequency;
-                long deadline = Stopwatch.GetTimestamp() + freq; // 1 секунда
+                long deadline = Stopwatch.GetTimestamp() + freq;
                 long first = 0, last = 0;
 
                 while (Stopwatch.GetTimestamp() < deadline)
@@ -418,13 +494,13 @@ static void ProbeParallelHidRead(int vid, int pid, string? interfacePath)
                 }
                 else
                 {
-                    Console.WriteLine($"открылось, но репортов почти нет ({reports}) — возможно, устройство молчит без движения руля");
+                    Console.WriteLine($"открылось, но репортов почти нет ({reports}) — устройство молчит без движения руля");
                 }
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"ошибка — {ex.Message}");
+            Console.WriteLine($"ошибка — {Brief(ex)}");
         }
     }
 
@@ -432,10 +508,16 @@ static void ProbeParallelHidRead(int vid, int pid, string? interfacePath)
         Console.WriteLine($"  DirectInput interface path: {interfacePath}");
 }
 
+static string TryDevicePath(HidDevice d)
+{
+    try { return d.DevicePath; } catch { return ""; }
+}
+
 static string SafePath(HidDevice d)
 {
-    try { return d.DevicePath.Length > 60 ? d.DevicePath[..60] + "…" : d.DevicePath; }
-    catch { return "<путь недоступен>"; }
+    string p = TryDevicePath(d);
+    if (p.Length == 0) return "<путь недоступен>";
+    return p.Length > 70 ? p[..70] + "…" : p;
 }
 
 static double Percentile(List<double> sorted, double p)
