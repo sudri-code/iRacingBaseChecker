@@ -59,6 +59,13 @@ internal static class WheelSettler
     /// <summary>
     /// Гасит движение и удерживает руль около <paramref name="targetPosition"/>.
     /// </summary>
+    /// <param name="polarity">
+    /// Знак связи между усилием и направлением движения оси: +1, если положительная сила
+    /// увеличивает координату, −1 если уменьшает. Величину обязательно измерять, а не
+    /// предполагать: у Moza ось инвертирована, и при неверном знаке этот регулятор
+    /// превращается из отрицательной обратной связи в положительную — вместо торможения
+    /// он разгоняет руль до края диапазона.
+    /// </param>
     /// <param name="tolerance">
     /// Допустимое расстояние до цели. Остановка дальше этого расстояния считается упором,
     /// а не успокоением: неподвижность сама по себе ничего не доказывает — руль,
@@ -70,6 +77,7 @@ internal static class WheelSettler
         EffectParameters p,
         AxisDef axis,
         int targetPosition,
+        int polarity,
         int tolerance = 4000,
         int timeoutMs = 4000)
     {
@@ -117,7 +125,7 @@ internal static class WheelSettler
                     : SettleOutcome.Stuck;
             }
 
-            double command = -SpringGain * (position - targetPosition) - DamperGain * velocity;
+            double command = polarity * (-SpringGain * (position - targetPosition) - DamperGain * velocity);
             force.Magnitude = (int)Math.Clamp(command, -MaxHoldForce, MaxHoldForce);
             p.Parameters = force;
             effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);

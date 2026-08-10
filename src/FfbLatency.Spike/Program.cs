@@ -127,21 +127,33 @@ try
     Console.WriteLine($"\nConstantForce эффект создан на оси {axis.Name}.");
     Console.WriteLine($"Effect.Start: {Describe(effect.Start(1, EffectPlayFlags.None))}");
 
-    // ── Шаг 5. Стоимость SetParameters ────────────────────────────────────────
+    // ── Шаг 5. Полярность оси ─────────────────────────────────────────────────
+    Console.WriteLine("\nСейчас будет короткий импульс малым усилием — руль слегка качнётся.");
+    Console.WriteLine("Освободите руль. Enter — продолжить.");
+    Console.ReadLine();
+
+    int polarity = DetectPolarity(device, effect, effectParams, axis);
+    if (polarity == 0)
+    {
+        Console.WriteLine("Полярность определить не удалось — дальше идти нельзя, замеры будут неверными.");
+        return 1;
+    }
+
+    // ── Шаг 6. Стоимость SetParameters ────────────────────────────────────────
     MeasureSetParametersCost(effect, effectParams);
 
-    // ── Шаг 6. Step response ──────────────────────────────────────────────────
+    // ── Шаг 7. Step response ──────────────────────────────────────────────────
     Console.WriteLine("\nСейчас будет подаваться усилие ~25% — руль дёрнется.");
     Console.WriteLine("Уберите руки, освободите руль. Enter — продолжить, любая другая клавиша — пропустить.");
     if (Console.ReadKey(true).Key == ConsoleKey.Enter)
-        MeasureStepResponse(device, effect, effectParams, axis);
+        MeasureStepResponse(device, effect, effectParams, axis, polarity);
     else
         Console.WriteLine("Step response пропущен.");
 
-    // ── Шаг 7. Параллельное чтение raw HID ────────────────────────────────────
+    // ── Шаг 8. Параллельное чтение raw HID ────────────────────────────────────
     var hidDevice = ProbeParallelHidRead(vid, pid, interfacePath);
 
-    // ── Шаг 8. Формат HID-репорта ─────────────────────────────────────────────
+    // ── Шаг 9. Формат HID-репорта ─────────────────────────────────────────────
     // Если HID читается, он предпочтительнее опроса DirectInput: репорт приходит сам,
     // и время его получения — честная метка, без джиттера нашего цикла опроса.
     if (hidDevice is not null)
@@ -297,6 +309,82 @@ static AxisDef? DetectSteeringAxis(IDirectInputDevice8 device)
 }
 
 /// <summary>
+/// Определяет, в какую сторону положительное усилие двигает ось.
+/// </summary>
+/// <remarks>
+/// Связь знака силы с направлением координаты зависит от базы: у Moza R21 ось
+/// инвертирована. Предполагать её нельзя — на неверной полярности успокоитель
+/// работает как положительная обратная связь и загоняет руль в край диапазона,
+/// а признак «ускорение направлено по силе» отбраковывает все замеры подряд.
+/// </remarks>
+/// <returns>+1, −1 или 0, если определить не удалось.</returns>
+static int DetectPolarity(IDirectInputDevice8 device, IDirectInputEffect effect, EffectParameters p, AxisDef axis)
+{
+    Console.WriteLine("\n--- Полярность оси ---");
+
+    const int probeForce = 2200;
+    const int probeMs = 120;
+    long freq = Stopwatch.Frequency;
+
+    var state = new JoystickState();
+    var force = new ConstantForce();
+
+    device.Poll();
+    device.GetCurrentJoystickState(ref state);
+    int baseline = Axes.Read(state, axis.Index);
+
+    int travel = Pulse(probeForce);
+
+    // Компенсирующий импульс той же длительности возвращает руль примерно на место,
+    // чтобы проба не сдвигала точку старта следующих тестов.
+    Pulse(-probeForce);
+
+    Console.WriteLine($"  Усилие +{probeForce} сместило ось на {travel} отсчётов (от {baseline})");
+
+    if (Math.Abs(travel) < 50)
+    {
+        Console.WriteLine("  Смещение слишком мало. Руль зажат, или усилие в софте базы выкручено в ноль.");
+        return 0;
+    }
+
+    int polarity = Math.Sign(travel);
+    Console.WriteLine(polarity > 0
+        ? "  → полярность +1: положительное усилие увеличивает координату"
+        : "  → полярность −1: положительное усилие уменьшает координату (ось инвертирована)");
+
+    return polarity;
+
+    int Pulse(int magnitude)
+    {
+        device.Poll();
+        device.GetCurrentJoystickState(ref state);
+        int from = Axes.Read(state, axis.Index);
+
+        force.Magnitude = magnitude;
+        p.Parameters = force;
+        effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
+
+        long until = Stopwatch.GetTimestamp() + freq * probeMs / 1000;
+        int furthest = 0;
+        while (Stopwatch.GetTimestamp() < until)
+        {
+            device.Poll();
+            device.GetCurrentJoystickState(ref state);
+            int delta = Axes.Read(state, axis.Index) - from;
+            if (Math.Abs(delta) > Math.Abs(furthest)) furthest = delta;
+        }
+
+        force.Magnitude = 0;
+        p.Parameters = force;
+        effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
+
+        // Даём инерции угаснуть, прежде чем мерить дальше.
+        Thread.Sleep(400);
+        return furthest;
+    }
+}
+
+/// <summary>
 /// Стоимость самого вызова SetParameters. Если он дорогой или блокирующий,
 /// это систематически войдёт в измеряемую задержку и потребует поправки.
 /// </summary>
@@ -359,7 +447,7 @@ static void MeasureSetParametersCost(IDirectInputEffect effect, EffectParameters
 /// Это ещё не измерительная методика (без параболической экстраполяции),
 /// а проверка того, что сигнал виден и порядок величины разумный.
 /// </summary>
-static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect effect, EffectParameters p, AxisDef axis)
+static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect effect, EffectParameters p, AxisDef axis, int polarity)
 {
     Console.WriteLine("\n--- Step response (грубо, 20 повторов) ---");
     Console.WriteLine("Выставьте руль примерно в центр и отпустите — нужен запас хода в обе стороны.");
@@ -389,7 +477,7 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
 
         // Активно гасим движение от прошлого повтора: пассивной паузы недостаточно,
         // автоцентр выключен и руль продолжает вращаться по инерции.
-        var settle = WheelSettler.Settle(device, effect, p, axis, home);
+        var settle = WheelSettler.Settle(device, effect, p, axis, home, polarity);
         if (settle == SettleOutcome.Stuck)
         {
             device.Poll();
@@ -455,6 +543,16 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
         }
 
         double ms = (detected - t0) * 1000.0 / freq;
+
+        // Ось обязана двинуться туда, куда толкает сила с учётом полярности.
+        // Обратное направление означает, что мы поймали не отклик, а остаточное движение.
+        int expected = Math.Sign(mag) * polarity;
+        if (Math.Sign(travel) != expected)
+        {
+            Console.WriteLine($"  #{rep,2}: движение против ожидаемого направления (смещение {travel}) — замер отброшен.");
+            continue;
+        }
+
         results.Add(ms);
         Console.WriteLine($"  #{rep,2}: {ms,6:F2} мс   усилие {mag,6}, позиция {baseline,6}, порог {threshold}, шум {noise}");
     }
