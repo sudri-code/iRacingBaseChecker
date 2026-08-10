@@ -478,11 +478,13 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
         // Активно гасим движение от прошлого повтора: пассивной паузы недостаточно,
         // автоцентр выключен и руль продолжает вращаться по инерции.
         var settle = WheelSettler.Settle(device, effect, p, axis, home, polarity);
+
+        device.Poll();
+        device.GetCurrentJoystickState(ref state);
+        int where = Axes.Read(state, axis.Index);
+
         if (settle == SettleOutcome.Stuck)
         {
-            device.Poll();
-            device.GetCurrentJoystickState(ref state);
-            int where = Axes.Read(state, axis.Index);
             Console.WriteLine($"  #{rep,2}: руль застрял на {where} (цель {home}, отклонение {where - home}) — похоже на упор.");
 
             if (++stuckInARow >= 3)
@@ -490,6 +492,14 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
                 Console.WriteLine("  Три раза подряд — прерываю серию. Верните руль в центр вручную и запустите снова.");
                 break;
             }
+            continue;
+        }
+
+        if (settle == SettleOutcome.Timeout)
+        {
+            // Мерить на движущемся руле бессмысленно: «покой» окажется движением,
+            // порог детектирования уедет вверх и отклик просто не будет виден.
+            Console.WriteLine($"  #{rep,2}: руль не успокоился за отведённое время (позиция {where}) — повтор пропущен.");
             continue;
         }
         stuckInARow = 0;
@@ -567,6 +577,7 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
     Console.WriteLine($"\n  Успешных замеров: {results.Count} из {repeats}");
     Console.WriteLine($"  Медиана: {results[results.Count / 2]:F2} мс, мин {results[0]:F2}, макс {results[^1]:F2}");
     Console.WriteLine($"  Разброс (p95-p5): {Percentile(results, 95) - Percentile(results, 5):F2} мс");
+    Console.WriteLine($"  Шум покоя должен быть близок к нулю: большой шум означает, что руль ещё двигался.");
     Console.WriteLine("  Внимание: это сквозная задержка вместе с механикой, а не задержка электроники.");
     Console.WriteLine("  Порог завышает результат на несколько мс; итоговый инструмент считает экстраполяцией.");
 }

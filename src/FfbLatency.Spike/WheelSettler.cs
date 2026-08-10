@@ -20,56 +20,66 @@ internal enum SettleOutcome
 /// Приводит руль в покой между повторами step-теста.
 ///
 /// Автоцентр выключен (иначе его пружина исказит отклик), поэтому после толчка руль
-/// ничем не удерживается и продолжает двигаться. Скорость гасится активно — программным
-/// демпфером, плюс пружина возвращает руль к исходной точке, чтобы за сотни повторов
-/// он не уполз в упор.
+/// ничем не удерживается и продолжает двигаться.
 ///
-/// Регулятор работает только между замерами и обязательно выключается перед подачей
-/// ступеньки: во время самого замера никакой посторонней силы быть не должно.
+/// Работа идёт в две фазы. Сначала активная: демпфер гасит скорость, пружина подтягивает
+/// руль к исходной точке, чтобы за сотни повторов он не уполз в упор. Затем усилие
+/// полностью снимается и руль должен успокоиться сам.
+///
+/// Вторая фаза принципиальна. Пока регулятор удерживает руль, тот слегка автоколеблется:
+/// в контуре сидит задержка самой базы около десяти миллисекунд, а скорость считается
+/// по разности квантованных отсчётов. Замерять в этот момент нельзя — «покой» окажется
+/// движением в тысячу отсчётов, и порог детектирования уедет в небо. Ступеньку нужно
+/// подавать на свободный руль.
 /// </summary>
 internal static class WheelSettler
 {
     /// <summary>Сила пружины на отсчёт отклонения от цели.</summary>
-    /// <remarks>При отклонении ~10000 отсчётов упирается в потолок усилия.</remarks>
     private const double SpringGain = 0.4;
 
     /// <summary>
     /// Сила демпфера на единицу скорости (отсчёты/мс).
     /// </summary>
     /// <remarks>
-    /// Порядок величины здесь принципиален. Полный ход руля — 65536 отсчётов на 900°,
-    /// так что один оборот в секунду это уже ~26 отсчётов/мс. Прежнее значение 12 давало
-    /// при такой скорости силу ~310 из 10000 и практически не тормозило — руль уезжал
-    /// в упор, а успокоитель считал его остановившимся.
+    /// Полный ход руля — 65536 отсчётов на 900°, так что один оборот в секунду это
+    /// ~26 отсчётов/мс. Слишком малое значение не тормозит вовсе, слишком большое
+    /// раскачивает контур из-за задержки базы. 120 — компромисс.
     /// </remarks>
-    private const double DamperGain = 250.0;
+    private const double DamperGain = 120.0;
 
     /// <summary>Потолок удерживающего усилия.</summary>
     private const int MaxHoldForce = 4000;
 
     /// <summary>Сглаживание оценки скорости: позиция квантована, а шаг цикла неровный.</summary>
-    private const double VelocitySmoothing = 0.35;
+    private const double VelocitySmoothing = 0.25;
 
-    /// <summary>Насколько неподвижным должен стать руль, отсчётов за окно проверки.</summary>
-    private const int StillnessThreshold = 3;
-
-    /// <summary>Сколько подряд миллисекунд руль должен оставаться неподвижным.</summary>
-    private const int StillnessWindowMs = 120;
+    /// <summary>Скорость, ниже которой активную фазу можно заканчивать, отсчёты/мс.</summary>
+    private const double SlowEnough = 1.0;
 
     /// <summary>
-    /// Гасит движение и удерживает руль около <paramref name="targetPosition"/>.
+    /// Разброс позиции, при котором руль считается стоящим, отсчётов.
+    /// </summary>
+    /// <remarks>
+    /// 20 отсчётов при полном ходе 65536 на 900° — это примерно четверть градуса.
+    /// Более жёсткий критерий недостижим: база отдаёт позицию с дрожанием младшего разряда.
+    /// </remarks>
+    private const int StillnessThreshold = 20;
+
+    /// <summary>Сколько подряд миллисекунд руль должен оставаться неподвижным.</summary>
+    private const int StillnessWindowMs = 100;
+
+    /// <summary>
+    /// Гасит движение, возвращает руль к <paramref name="targetPosition"/> и отпускает его.
     /// </summary>
     /// <param name="polarity">
-    /// Знак связи между усилием и направлением движения оси: +1, если положительная сила
-    /// увеличивает координату, −1 если уменьшает. Величину обязательно измерять, а не
-    /// предполагать: у Moza ось инвертирована, и при неверном знаке этот регулятор
-    /// превращается из отрицательной обратной связи в положительную — вместо торможения
-    /// он разгоняет руль до края диапазона.
+    /// Знак связи между усилием и направлением движения оси. Величину обязательно измерять:
+    /// у Moza ось инвертирована, и при неверном знаке регулятор превращается из отрицательной
+    /// обратной связи в положительную — вместо торможения разгоняет руль до края диапазона.
     /// </param>
     /// <param name="tolerance">
-    /// Допустимое расстояние до цели. Остановка дальше этого расстояния считается упором,
-    /// а не успокоением: неподвижность сама по себе ничего не доказывает — руль,
-    /// прижатый к ограничителю, тоже неподвижен.
+    /// Допустимое расстояние до цели. Остановка дальше считается упором, а не успокоением:
+    /// неподвижность сама по себе ничего не доказывает — руль, прижатый к ограничителю,
+    /// тоже неподвижен.
     /// </param>
     public static SettleOutcome Settle(
         IDirectInputDevice8 device,
@@ -79,23 +89,23 @@ internal static class WheelSettler
         int targetPosition,
         int polarity,
         int tolerance = 4000,
-        int timeoutMs = 4000)
+        int activeMs = 3000,
+        int relaxMs = 1500)
     {
         var state = new JoystickState();
         var force = new ConstantForce();
         long freq = Stopwatch.Frequency;
-        long deadline = Stopwatch.GetTimestamp() + freq * timeoutMs / 1000;
+
+        // ── Фаза 1: активно гасим и подтягиваем к цели ────────────────────────
+        long activeDeadline = Stopwatch.GetTimestamp() + freq * activeMs / 1000;
 
         device.Poll();
         device.GetCurrentJoystickState(ref state);
         int previous = Axes.Read(state, axis.Index);
         long previousTime = Stopwatch.GetTimestamp();
-
         double velocity = 0;
-        int stillMin = previous, stillMax = previous;
-        long stillSince = previousTime;
 
-        while (Stopwatch.GetTimestamp() < deadline)
+        while (Stopwatch.GetTimestamp() < activeDeadline)
         {
             device.Poll();
             device.GetCurrentJoystickState(ref state);
@@ -109,6 +119,38 @@ internal static class WheelSettler
                 velocity += VelocitySmoothing * (instant - velocity);
             }
 
+            previous = position;
+            previousTime = now;
+
+            if (Math.Abs(position - targetPosition) <= tolerance && Math.Abs(velocity) < SlowEnough)
+                break;
+
+            double command = polarity * (-SpringGain * (position - targetPosition) - DamperGain * velocity);
+            force.Magnitude = (int)Math.Clamp(command, -MaxHoldForce, MaxHoldForce);
+            p.Parameters = force;
+            effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
+        }
+
+        // ── Фаза 2: отпускаем и ждём, пока руль встанет сам ───────────────────
+        force.Magnitude = 0;
+        p.Parameters = force;
+        effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
+
+        long relaxDeadline = Stopwatch.GetTimestamp() + freq * relaxMs / 1000;
+
+        device.Poll();
+        device.GetCurrentJoystickState(ref state);
+        int stillMin = Axes.Read(state, axis.Index);
+        int stillMax = stillMin;
+        long stillSince = Stopwatch.GetTimestamp();
+
+        while (Stopwatch.GetTimestamp() < relaxDeadline)
+        {
+            device.Poll();
+            device.GetCurrentJoystickState(ref state);
+            int position = Axes.Read(state, axis.Index);
+            long now = Stopwatch.GetTimestamp();
+
             if (position < stillMin) stillMin = position;
             if (position > stillMax) stillMax = position;
 
@@ -116,32 +158,17 @@ internal static class WheelSettler
             {
                 stillMin = stillMax = position;
                 stillSince = now;
+                continue;
             }
-            else if ((now - stillSince) * 1000.0 / freq >= StillnessWindowMs)
+
+            if ((now - stillSince) * 1000.0 / freq >= StillnessWindowMs)
             {
-                Release(effect, p, force);
                 return Math.Abs(position - targetPosition) <= tolerance
                     ? SettleOutcome.Settled
                     : SettleOutcome.Stuck;
             }
-
-            double command = polarity * (-SpringGain * (position - targetPosition) - DamperGain * velocity);
-            force.Magnitude = (int)Math.Clamp(command, -MaxHoldForce, MaxHoldForce);
-            p.Parameters = force;
-            effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
-
-            previous = position;
-            previousTime = now;
         }
 
-        Release(effect, p, force);
         return SettleOutcome.Timeout;
-    }
-
-    private static void Release(IDirectInputEffect effect, EffectParameters p, ConstantForce force)
-    {
-        force.Magnitude = 0;
-        p.Parameters = force;
-        effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
     }
 }
