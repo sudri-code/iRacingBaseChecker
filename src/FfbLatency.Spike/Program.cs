@@ -139,7 +139,13 @@ try
         Console.WriteLine("Step response пропущен.");
 
     // ── Шаг 7. Параллельное чтение raw HID ────────────────────────────────────
-    ProbeParallelHidRead(vid, pid, interfacePath);
+    var hidDevice = ProbeParallelHidRead(vid, pid, interfacePath);
+
+    // ── Шаг 8. Формат HID-репорта ─────────────────────────────────────────────
+    // Если HID читается, он предпочтительнее опроса DirectInput: репорт приходит сам,
+    // и время его получения — честная метка, без джиттера нашего цикла опроса.
+    if (hidDevice is not null)
+        HidAxisFinder.Probe(hidDevice, device, axis);
 
     Console.WriteLine("\n=== Spike завершён ===");
     return 0;
@@ -203,19 +209,6 @@ static string Describe(SharpGen.Runtime.Result r)
     return $"FAILED (0x{r.Code:X8}){hint}";
 }
 
-static int ReadAxis(JoystickState s, int index) => index switch
-{
-    0 => s.X,
-    1 => s.Y,
-    2 => s.Z,
-    3 => s.RotationX,
-    4 => s.RotationY,
-    5 => s.RotationZ,
-    6 => s.Sliders is { Length: > 0 } sl ? sl[0] : 0,
-    7 => s.Sliders is { Length: > 1 } sl2 ? sl2[1] : 0,
-    _ => 0,
-};
-
 /// <summary>
 /// Определяет рулевую ось по фактическому размаху при вращении и заодно меряет,
 /// с какой частотой база отдаёт новые значения.
@@ -226,17 +219,7 @@ static int ReadAxis(JoystickState s, int index) => index switch
 /// </remarks>
 static AxisDef? DetectSteeringAxis(IDirectInputDevice8 device)
 {
-    var all = new[]
-    {
-        new AxisDef("X", JoystickOffset.X, 0),
-        new AxisDef("Y", JoystickOffset.Y, 1),
-        new AxisDef("Z", JoystickOffset.Z, 2),
-        new AxisDef("RotationX", JoystickOffset.RotationX, 3),
-        new AxisDef("RotationY", JoystickOffset.RotationY, 4),
-        new AxisDef("RotationZ", JoystickOffset.RotationZ, 5),
-        new AxisDef("Slider0", JoystickOffset.Sliders0, 6),
-        new AxisDef("Slider1", JoystickOffset.Sliders1, 7),
-    };
+    var all = Axes.All;
 
     Console.WriteLine("\n--- Рулевая ось и частота обновления ---");
     Console.WriteLine("Плавно покрутите руль влево-вправо примерно на пол-оборота. Enter — старт (5 секунд).");
@@ -249,10 +232,10 @@ static AxisDef? DetectSteeringAxis(IDirectInputDevice8 device)
 
     device.Poll();
     device.GetCurrentJoystickState(ref state);
-    for (int a = 0; a < all.Length; a++) min[a] = max[a] = ReadAxis(state, a);
+    for (int a = 0; a < all.Length; a++) min[a] = max[a] = Axes.Read(state, a);
 
     var intervals = new List<double>(30000);
-    int previous = ReadAxis(state, 0);
+    int previous = Axes.Read(state, 0);
     long lastChange = Stopwatch.GetTimestamp();
     long deadline = lastChange + freq * 5;
     int changes = 0;
@@ -265,7 +248,7 @@ static AxisDef? DetectSteeringAxis(IDirectInputDevice8 device)
 
         for (int a = 0; a < all.Length; a++)
         {
-            int v = ReadAxis(state, a);
+            int v = Axes.Read(state, a);
             if (v < min[a]) min[a] = v;
             if (v > max[a]) max[a] = v;
         }
@@ -276,7 +259,7 @@ static AxisDef? DetectSteeringAxis(IDirectInputDevice8 device)
             if (max[a] - min[a] > max[best] - min[best]) best = a;
         steeringGuess = best;
 
-        int current = ReadAxis(state, best);
+        int current = Axes.Read(state, best);
         if (current != previous)
         {
             long now = Stopwatch.GetTimestamp();
@@ -343,8 +326,32 @@ static void MeasureSetParametersCost(IDirectInputEffect effect, EffectParameters
     effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
 
     costs.Sort();
-    Console.WriteLine($"  медиана {costs[costs.Count / 2]:F4} мс, p95 {Percentile(costs, 95):F4} мс, max {costs[^1]:F4} мс");
-    Console.WriteLine("  (медиана заметно больше ~0.05 мс — вызов блокирующий, нужна поправка)");
+    double median = costs[costs.Count / 2];
+    Console.WriteLine($"  медиана {median:F4} мс, p95 {Percentile(costs, 95):F4} мс, max {costs[^1]:F4} мс");
+
+    if (median > 0.2)
+    {
+        // Если вызов блокирующий, важно понять, чем он занят. Кратность миллисекунде
+        // означала бы ожидание USB-фреймов: команда уходит в следующем фрейме, и тогда
+        // момент реальной отправки известен с точностью до кванта, а не «где-то внутри вызова».
+        Console.WriteLine("  Распределение (бины по 0.25 мс):");
+        var histogram = new SortedDictionary<int, int>();
+        foreach (double c in costs)
+        {
+            int bin = (int)(c / 0.25);
+            histogram[bin] = histogram.GetValueOrDefault(bin) + 1;
+        }
+
+        foreach (var (bin, count) in histogram)
+        {
+            if (count * 100 / costs.Count < 1) continue;
+            string bar = new('#', Math.Max(1, count * 40 / costs.Count));
+            Console.WriteLine($"    {bin * 0.25,5:F2}–{(bin + 1) * 0.25,-5:F2} мс {count,5}  {bar}");
+        }
+
+        Console.WriteLine("  Вызов блокирующий: реальный момент отправки лежит внутри этого интервала,");
+        Console.WriteLine("  что даёт систематическую неопределённость того же порядка. Учесть при сравнении баз.");
+    }
 }
 
 /// <summary>
@@ -362,20 +369,25 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
     var state = new JoystickState();
     var force = new ConstantForce();
     var results = new List<double>(repeats);
+    int unsettled = 0;
+
+    // Точка, к которой руль возвращается между повторами: иначе за серию он уползёт в упор.
+    device.Poll();
+    device.GetCurrentJoystickState(ref state);
+    int home = Axes.Read(state, axis.Index);
 
     for (int rep = 0; rep < repeats; rep++)
     {
         // Знак чередуем, иначе руль за несколько повторов уедет в упор.
         int mag = (rep % 2 == 0) ? magnitude : -magnitude;
 
-        force.Magnitude = 0;
-        p.Parameters = force;
-        effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
-        Thread.Sleep(250);
+        // Активно гасим движение от прошлого повтора. Пассивной паузы недостаточно:
+        // автоцентр выключен, и руль продолжает вращаться по инерции.
+        if (!WheelSettler.Settle(device, effect, p, axis, home)) unsettled++;
 
         device.Poll();
         device.GetCurrentJoystickState(ref state);
-        int baseline = ReadAxis(state, axis.Index);
+        int baseline = Axes.Read(state, axis.Index);
 
         int noise = 0;
         long noiseDeadline = Stopwatch.GetTimestamp() + freq / 10; // 100 мс
@@ -383,7 +395,7 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
         {
             device.Poll();
             device.GetCurrentJoystickState(ref state);
-            noise = Math.Max(noise, Math.Abs(ReadAxis(state, axis.Index) - baseline));
+            noise = Math.Max(noise, Math.Abs(Axes.Read(state, axis.Index) - baseline));
         }
         int threshold = Math.Max(noise * 3, 2);
 
@@ -399,7 +411,7 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
         {
             device.Poll();
             device.GetCurrentJoystickState(ref state);
-            if (Math.Abs(ReadAxis(state, axis.Index) - baseline) > threshold) { detected = Stopwatch.GetTimestamp(); break; }
+            if (Math.Abs(Axes.Read(state, axis.Index) - baseline) > threshold) { detected = Stopwatch.GetTimestamp(); break; }
         }
 
         force.Magnitude = 0;
@@ -426,7 +438,10 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
     results.Sort();
     Console.WriteLine($"\n  Медиана: {results[results.Count / 2]:F2} мс, мин {results[0]:F2}, макс {results[^1]:F2}");
     Console.WriteLine($"  Разброс (p95-p5): {Percentile(results, 95) - Percentile(results, 5):F2} мс");
+    if (unsettled > 0)
+        Console.WriteLine($"  Руль не успел остановиться перед {unsettled} повтором(ами) — эти замеры сомнительны.");
     Console.WriteLine("  Внимание: это сквозная задержка вместе с механикой, а не задержка электроники.");
+    Console.WriteLine("  Порог завышает результат на несколько мс; итоговый инструмент считает экстраполяцией.");
 }
 
 /// <summary>
@@ -434,15 +449,17 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
 /// устройство в exclusive-режиме. Если да — появляется независимый второй источник
 /// данных для кросс-проверки замеров.
 /// </summary>
-static void ProbeParallelHidRead(int vid, int pid, string? interfacePath)
+static HidDevice? ProbeParallelHidRead(int vid, int pid, string? interfacePath)
 {
     Console.WriteLine("\n--- Параллельное чтение raw HID ---");
 
     if (vid == 0)
     {
         Console.WriteLine("  VID неизвестен — пропускаем.");
-        return;
+        return null;
     }
+
+    HidDevice? readable = null;
 
     // Некоторые базы сообщают PID как 0000, поэтому фильтруем только по VID.
     var candidates = DeviceList.Local.GetHidDevices(vendorID: vid).ToList();
@@ -491,6 +508,7 @@ static void ProbeParallelHidRead(int vid, int pid, string? interfacePath)
                     double seconds = (last - first) / (double)freq;
                     double rate = seconds > 0 ? (reports - 1) / seconds : 0;
                     Console.WriteLine($"ЧИТАЕТСЯ. Репортов {reports}, длина {buffer.Length} Б, ≈{rate:F0} Гц");
+                    readable ??= hid;
                 }
                 else
                 {
@@ -506,6 +524,8 @@ static void ProbeParallelHidRead(int vid, int pid, string? interfacePath)
 
     if (interfacePath is not null)
         Console.WriteLine($"  DirectInput interface path: {interfacePath}");
+
+    return readable;
 }
 
 static string TryDevicePath(HidDevice d)
