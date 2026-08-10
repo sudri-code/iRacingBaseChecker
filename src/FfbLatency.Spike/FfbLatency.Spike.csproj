@@ -6,6 +6,8 @@
     <RootNamespace>FfbLatency.Spike</RootNamespace>
     <AssemblyName>FfbLatency.Spike</AssemblyName>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
     <!--
       TFM намеренно net8.0, а не net8.0-windows: так проект компилируется и на macOS,
       что позволяет проверять код без Windows-машины. Запускается он всё равно только

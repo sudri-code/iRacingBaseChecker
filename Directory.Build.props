@@ -5,8 +5,11 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
-    <Platforms>x64</Platforms>
-    <PlatformTarget>x64</PlatformTarget>
+    <!--
+      PlatformTarget здесь намеренно не задан. x64 нужен только проектам, работающим
+      с DirectInput и WPF, и объявлен в них самих: если навязать x64 всему решению,
+      тесты перестают запускаться на arm64-машинах.
+    -->
   </PropertyGroup>
 
   <!--
