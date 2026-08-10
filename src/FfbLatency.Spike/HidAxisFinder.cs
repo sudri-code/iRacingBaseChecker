@@ -83,6 +83,16 @@ internal static class HidAxisFinder
 
         Console.WriteLine($"  Собрано: {reports.Count} HID-репортов, {direct.Count} отсчётов DirectInput");
 
+        // Первый байт — report ID. Устройство может слать несколько видов репортов,
+        // и позиция лежит на своём месте только в одном из них: в остальных по тому же
+        // смещению окажется что-то другое, что портит и разбор, и оценку частоты.
+        var byId = reports.GroupBy(r => r.Data.Length > 0 ? r.Data[0] : -1)
+                          .OrderByDescending(g => g.Count())
+                          .ToList();
+        Console.WriteLine("  Репорты по ID: " + string.Join(", ", byId.Select(g => $"0x{g.Key:X2} × {g.Count()}")));
+        if (byId.Count > 1)
+            Console.WriteLine("  Видов репортов больше одного — в Core фильтровать по ID, иначе разбор будет ловить чужие данные.");
+
         if (reports.Count < 100 || direct.Count < 100)
         {
             Console.WriteLine("  Данных мало — определить формат нельзя.");

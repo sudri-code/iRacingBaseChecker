@@ -76,8 +76,13 @@ internal static class WheelSettler
     /// у Moza ось инвертирована, и при неверном знаке регулятор превращается из отрицательной
     /// обратной связи в положительную — вместо торможения разгоняет руль до края диапазона.
     /// </param>
-    /// <param name="tolerance">
-    /// Допустимое расстояние до цели. Остановка дальше считается упором, а не успокоением:
+    /// <param name="returnTolerance">
+    /// Насколько точно активная фаза возвращает руль к цели. Должен быть заметно меньше
+    /// <paramref name="stuckTolerance"/>: если прекращать возврат уже на границе допуска,
+    /// каждый повтор оставляет руль сдвинутым, и за серию ошибка накапливается в дрейф.
+    /// </param>
+    /// <param name="stuckTolerance">
+    /// Расстояние, дальше которого остановка считается упором, а не успокоением:
     /// неподвижность сама по себе ничего не доказывает — руль, прижатый к ограничителю,
     /// тоже неподвижен.
     /// </param>
@@ -89,7 +94,8 @@ internal static class WheelSettler
         int targetPosition,
         int polarity,
         EffectParameterFlags flags,
-        int tolerance = 4000,
+        int returnTolerance = 800,
+        int stuckTolerance = 6000,
         int activeMs = 3000,
         int relaxMs = 1500)
     {
@@ -123,7 +129,7 @@ internal static class WheelSettler
             previous = position;
             previousTime = now;
 
-            if (Math.Abs(position - targetPosition) <= tolerance && Math.Abs(velocity) < SlowEnough)
+            if (Math.Abs(position - targetPosition) <= returnTolerance && Math.Abs(velocity) < SlowEnough)
                 break;
 
             double command = polarity * (-SpringGain * (position - targetPosition) - DamperGain * velocity);
@@ -164,7 +170,7 @@ internal static class WheelSettler
 
             if ((now - stillSince) * 1000.0 / freq >= StillnessWindowMs)
             {
-                return Math.Abs(position - targetPosition) <= tolerance
+                return Math.Abs(position - targetPosition) <= stuckTolerance
                     ? SettleOutcome.Settled
                     : SettleOutcome.Stuck;
             }
