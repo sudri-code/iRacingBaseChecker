@@ -362,35 +362,56 @@ static void MeasureSetParametersCost(IDirectInputEffect effect, EffectParameters
 static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect effect, EffectParameters p, AxisDef axis)
 {
     Console.WriteLine("\n--- Step response (грубо, 20 повторов) ---");
+    Console.WriteLine("Выставьте руль примерно в центр и отпустите — нужен запас хода в обе стороны.");
+    Console.WriteLine("Enter — начать.");
+    Console.ReadLine();
+
     const int repeats = 20;
-    const int magnitude = 2500; // 25%
+    const int magnitude = 2500;   // 25%
+    const int holdMs = 60;        // ступенька снимается сразу после детекта, это лишь потолок
     long freq = Stopwatch.Frequency;
 
     var state = new JoystickState();
     var force = new ConstantForce();
     var results = new List<double>(repeats);
-    int unsettled = 0;
 
-    // Точка, к которой руль возвращается между повторами: иначе за серию он уползёт в упор.
     device.Poll();
     device.GetCurrentJoystickState(ref state);
     int home = Axes.Read(state, axis.Index);
+    Console.WriteLine($"  Исходная позиция: {home}");
+
+    int stuckInARow = 0;
 
     for (int rep = 0; rep < repeats; rep++)
     {
         // Знак чередуем, иначе руль за несколько повторов уедет в упор.
         int mag = (rep % 2 == 0) ? magnitude : -magnitude;
 
-        // Активно гасим движение от прошлого повтора. Пассивной паузы недостаточно:
-        // автоцентр выключен, и руль продолжает вращаться по инерции.
-        if (!WheelSettler.Settle(device, effect, p, axis, home)) unsettled++;
+        // Активно гасим движение от прошлого повтора: пассивной паузы недостаточно,
+        // автоцентр выключен и руль продолжает вращаться по инерции.
+        var settle = WheelSettler.Settle(device, effect, p, axis, home);
+        if (settle == SettleOutcome.Stuck)
+        {
+            device.Poll();
+            device.GetCurrentJoystickState(ref state);
+            int where = Axes.Read(state, axis.Index);
+            Console.WriteLine($"  #{rep,2}: руль застрял на {where} (цель {home}, отклонение {where - home}) — похоже на упор.");
+
+            if (++stuckInARow >= 3)
+            {
+                Console.WriteLine("  Три раза подряд — прерываю серию. Верните руль в центр вручную и запустите снова.");
+                break;
+            }
+            continue;
+        }
+        stuckInARow = 0;
 
         device.Poll();
         device.GetCurrentJoystickState(ref state);
         int baseline = Axes.Read(state, axis.Index);
 
         int noise = 0;
-        long noiseDeadline = Stopwatch.GetTimestamp() + freq / 10; // 100 мс
+        long noiseDeadline = Stopwatch.GetTimestamp() + freq / 20; // 50 мс
         while (Stopwatch.GetTimestamp() < noiseDeadline)
         {
             device.Poll();
@@ -405,41 +426,49 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
         long t0 = Stopwatch.GetTimestamp();
         effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
 
-        long timeout = t0 + freq / 5; // 200 мс
+        long timeout = t0 + freq * holdMs / 1000;
         long detected = 0;
+        int travel = 0;
+
         while (Stopwatch.GetTimestamp() < timeout)
         {
             device.Poll();
             device.GetCurrentJoystickState(ref state);
-            if (Math.Abs(Axes.Read(state, axis.Index) - baseline) > threshold) { detected = Stopwatch.GetTimestamp(); break; }
+            int delta = Axes.Read(state, axis.Index) - baseline;
+            if (Math.Abs(delta) > Math.Abs(travel)) travel = delta;
+            if (detected == 0 && Math.Abs(delta) > threshold) { detected = Stopwatch.GetTimestamp(); break; }
         }
 
+        // Ступеньку снимаем немедленно: чем дольше она держится, тем сильнее руль
+        // разгоняется и тем дальше уезжает от центра к следующему повтору.
         force.Magnitude = 0;
         p.Parameters = force;
         effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
 
         if (detected == 0)
         {
-            Console.WriteLine($"  #{rep,2}: движение не обнаружено (порог {threshold}, шум {noise})");
+            // Смещение за время удержания отличает упор от отсутствия отклика:
+            // при упоре руль не сдвинется вовсе, при слабом усилии — сдвинется, но мало.
+            Console.WriteLine($"  #{rep,2}: движения нет. Усилие {mag,6}, смещение за {holdMs} мс: {travel,6}, " +
+                              $"позиция {baseline}, порог {threshold}");
             continue;
         }
 
         double ms = (detected - t0) * 1000.0 / freq;
         results.Add(ms);
-        Console.WriteLine($"  #{rep,2}: {ms,6:F2} мс   (порог {threshold}, шум {noise})");
+        Console.WriteLine($"  #{rep,2}: {ms,6:F2} мс   усилие {mag,6}, позиция {baseline,6}, порог {threshold}, шум {noise}");
     }
 
     if (results.Count == 0)
     {
-        Console.WriteLine("  Ни одного успешного замера. Проверьте, что руль свободен, а усилие в софте базы не в нуле.");
+        Console.WriteLine("  Ни одного успешного замера. Проверьте, что руль свободен и усилие в софте базы не в нуле.");
         return;
     }
 
     results.Sort();
-    Console.WriteLine($"\n  Медиана: {results[results.Count / 2]:F2} мс, мин {results[0]:F2}, макс {results[^1]:F2}");
+    Console.WriteLine($"\n  Успешных замеров: {results.Count} из {repeats}");
+    Console.WriteLine($"  Медиана: {results[results.Count / 2]:F2} мс, мин {results[0]:F2}, макс {results[^1]:F2}");
     Console.WriteLine($"  Разброс (p95-p5): {Percentile(results, 95) - Percentile(results, 5):F2} мс");
-    if (unsettled > 0)
-        Console.WriteLine($"  Руль не успел остановиться перед {unsettled} повтором(ами) — эти замеры сомнительны.");
     Console.WriteLine("  Внимание: это сквозная задержка вместе с механикой, а не задержка электроники.");
     Console.WriteLine("  Порог завышает результат на несколько мс; итоговый инструмент считает экстраполяцией.");
 }
