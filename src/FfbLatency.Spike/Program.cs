@@ -127,26 +127,27 @@ try
     Console.WriteLine($"\nConstantForce эффект создан на оси {axis.Name}.");
     Console.WriteLine($"Effect.Start: {Describe(effect.Start(1, EffectPlayFlags.None))}");
 
-    // ── Шаг 5. Полярность оси ─────────────────────────────────────────────────
+    // ── Шаг 5. Выбор флагов обновления ────────────────────────────────────────
+    var updateFlags = BenchmarkUpdateFlags(effect, effectParams);
+
+    // ── Шаг 6. Полярность оси ─────────────────────────────────────────────────
     Console.WriteLine("\nСейчас будет короткий импульс малым усилием — руль слегка качнётся.");
     Console.WriteLine("Освободите руль. Enter — продолжить.");
     Console.ReadLine();
 
-    int polarity = DetectPolarity(device, effect, effectParams, axis);
+    int polarity = DetectPolarity(device, effect, effectParams, axis, updateFlags);
     if (polarity == 0)
     {
         Console.WriteLine("Полярность определить не удалось — дальше идти нельзя, замеры будут неверными.");
+        Console.WriteLine("Если выбранные флаги не доставляют усилие, это тоже проявится здесь.");
         return 1;
     }
-
-    // ── Шаг 6. Стоимость SetParameters ────────────────────────────────────────
-    MeasureSetParametersCost(effect, effectParams);
 
     // ── Шаг 7. Step response ──────────────────────────────────────────────────
     Console.WriteLine("\nСейчас будет подаваться усилие ~25% — руль дёрнется.");
     Console.WriteLine("Уберите руки, освободите руль. Enter — продолжить, любая другая клавиша — пропустить.");
     if (Console.ReadKey(true).Key == ConsoleKey.Enter)
-        MeasureStepResponse(device, effect, effectParams, axis, polarity);
+        MeasureStepResponse(device, effect, effectParams, axis, polarity, updateFlags);
     else
         Console.WriteLine("Step response пропущен.");
 
@@ -318,7 +319,7 @@ static AxisDef? DetectSteeringAxis(IDirectInputDevice8 device)
 /// а признак «ускорение направлено по силе» отбраковывает все замеры подряд.
 /// </remarks>
 /// <returns>+1, −1 или 0, если определить не удалось.</returns>
-static int DetectPolarity(IDirectInputDevice8 device, IDirectInputEffect effect, EffectParameters p, AxisDef axis)
+static int DetectPolarity(IDirectInputDevice8 device, IDirectInputEffect effect, EffectParameters p, AxisDef axis, EffectParameterFlags flags)
 {
     Console.WriteLine("\n--- Полярность оси ---");
 
@@ -362,7 +363,7 @@ static int DetectPolarity(IDirectInputDevice8 device, IDirectInputEffect effect,
 
         force.Magnitude = magnitude;
         p.Parameters = force;
-        effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
+        effect.SetParameters(p, flags);
 
         long until = Stopwatch.GetTimestamp() + freq * probeMs / 1000;
         int furthest = 0;
@@ -376,7 +377,7 @@ static int DetectPolarity(IDirectInputDevice8 device, IDirectInputEffect effect,
 
         force.Magnitude = 0;
         p.Parameters = force;
-        effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
+        effect.SetParameters(p, flags);
 
         // Даём инерции угаснуть, прежде чем мерить дальше.
         Thread.Sleep(400);
@@ -385,13 +386,53 @@ static int DetectPolarity(IDirectInputDevice8 device, IDirectInputEffect effect,
 }
 
 /// <summary>
-/// Стоимость самого вызова SetParameters. Если он дорогой или блокирующий,
-/// это систематически войдёт в измеряемую задержку и потребует поправки.
+/// Сравнивает варианты флагов обновления эффекта и выбирает самый быстрый.
 /// </summary>
-static void MeasureSetParametersCost(IDirectInputEffect effect, EffectParameters p)
+/// <remarks>
+/// Флаги решают, сколько отчётов драйвер отправит устройству. Если единственный
+/// параметрический флаг — TypeSpecificParameters, уходит только type-specific отчёт;
+/// любой дополнительный заставляет слать ещё и «basic». Флаг Start вдобавок просит
+/// заново запустить эффект, то есть на каждое изменение усилия идёт отдельная команда.
+/// irFFB обновляет эффект как TypeSpecificParameters | NoRestart, SDL пришёл к голому
+/// TypeSpecificParameters. Что быстрее на конкретной базе — вопрос эмпирический,
+/// а цена ошибки здесь около миллисекунды при измеряемых единицах миллисекунд.
+/// </remarks>
+static EffectParameterFlags BenchmarkUpdateFlags(IDirectInputEffect effect, EffectParameters p)
 {
-    Console.WriteLine("\n--- Стоимость SetParameters ---");
-    const int n = 1000;
+    Console.WriteLine("\n--- Стоимость обновления эффекта при разных флагах ---");
+
+    var variants = new (string Name, EffectParameterFlags Flags)[]
+    {
+        ("TypeSpecificParameters",             EffectParameterFlags.TypeSpecificParameters),
+        ("TypeSpecificParameters | NoRestart", EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.NoRestart),
+        ("TypeSpecificParameters | Start",     EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start),
+    };
+
+    var best = variants[0].Flags;
+    double bestMedian = double.MaxValue;
+
+    foreach (var (name, flags) in variants)
+    {
+        var costs = MeasureFlagCost(effect, p, flags, 400);
+        costs.Sort();
+        double median = costs[costs.Count / 2];
+
+        Console.WriteLine($"  {name,-36} медиана {median,6:F3} мс, p95 {Percentile(costs, 95),6:F3}, max {costs[^1],6:F3}");
+
+        if (median < bestMedian) { bestMedian = median; best = flags; }
+    }
+
+    Console.WriteLine($"  → выбрано: {Describe(best)} ({bestMedian:F3} мс)");
+    if (bestMedian > 1.5)
+        Console.WriteLine("  Даже лучший вариант ждёт больше фрейма — задержка стека войдёт в результат.");
+
+    return best;
+
+    static string Describe(EffectParameterFlags f) => f.ToString();
+}
+
+static List<double> MeasureFlagCost(IDirectInputEffect effect, EffectParameters p, EffectParameterFlags flags, int n)
+{
     var costs = new List<double>(n);
     var force = new ConstantForce();
     long freq = Stopwatch.Frequency;
@@ -403,7 +444,7 @@ static void MeasureSetParametersCost(IDirectInputEffect effect, EffectParameters
         p.Parameters = force;
 
         long t0 = Stopwatch.GetTimestamp();
-        effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
+        effect.SetParameters(p, flags);
         long t1 = Stopwatch.GetTimestamp();
 
         costs.Add((t1 - t0) * 1000.0 / freq);
@@ -411,35 +452,9 @@ static void MeasureSetParametersCost(IDirectInputEffect effect, EffectParameters
 
     force.Magnitude = 0;
     p.Parameters = force;
-    effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
+    effect.SetParameters(p, flags);
 
-    costs.Sort();
-    double median = costs[costs.Count / 2];
-    Console.WriteLine($"  медиана {median:F4} мс, p95 {Percentile(costs, 95):F4} мс, max {costs[^1]:F4} мс");
-
-    if (median > 0.2)
-    {
-        // Если вызов блокирующий, важно понять, чем он занят. Кратность миллисекунде
-        // означала бы ожидание USB-фреймов: команда уходит в следующем фрейме, и тогда
-        // момент реальной отправки известен с точностью до кванта, а не «где-то внутри вызова».
-        Console.WriteLine("  Распределение (бины по 0.25 мс):");
-        var histogram = new SortedDictionary<int, int>();
-        foreach (double c in costs)
-        {
-            int bin = (int)(c / 0.25);
-            histogram[bin] = histogram.GetValueOrDefault(bin) + 1;
-        }
-
-        foreach (var (bin, count) in histogram)
-        {
-            if (count * 100 / costs.Count < 1) continue;
-            string bar = new('#', Math.Max(1, count * 40 / costs.Count));
-            Console.WriteLine($"    {bin * 0.25,5:F2}–{(bin + 1) * 0.25,-5:F2} мс {count,5}  {bar}");
-        }
-
-        Console.WriteLine("  Вызов блокирующий: реальный момент отправки лежит внутри этого интервала,");
-        Console.WriteLine("  что даёт систематическую неопределённость того же порядка. Учесть при сравнении баз.");
-    }
+    return costs;
 }
 
 /// <summary>
@@ -447,7 +462,7 @@ static void MeasureSetParametersCost(IDirectInputEffect effect, EffectParameters
 /// Это ещё не измерительная методика (без параболической экстраполяции),
 /// а проверка того, что сигнал виден и порядок величины разумный.
 /// </summary>
-static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect effect, EffectParameters p, AxisDef axis, int polarity)
+static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect effect, EffectParameters p, AxisDef axis, int polarity, EffectParameterFlags flags)
 {
     Console.WriteLine("\n--- Step response (грубо, 20 повторов) ---");
     Console.WriteLine("Выставьте руль примерно в центр и отпустите — нужен запас хода в обе стороны.");
@@ -477,7 +492,7 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
 
         // Активно гасим движение от прошлого повтора: пассивной паузы недостаточно,
         // автоцентр выключен и руль продолжает вращаться по инерции.
-        var settle = WheelSettler.Settle(device, effect, p, axis, home, polarity);
+        var settle = WheelSettler.Settle(device, effect, p, axis, home, polarity, flags);
 
         device.Poll();
         device.GetCurrentJoystickState(ref state);
@@ -522,7 +537,7 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
         p.Parameters = force;
 
         long t0 = Stopwatch.GetTimestamp();
-        effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
+        effect.SetParameters(p, flags);
 
         long timeout = t0 + freq * holdMs / 1000;
         long detected = 0;
@@ -541,7 +556,7 @@ static void MeasureStepResponse(IDirectInputDevice8 device, IDirectInputEffect e
         // разгоняется и тем дальше уезжает от центра к следующему повтору.
         force.Magnitude = 0;
         p.Parameters = force;
-        effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
+        effect.SetParameters(p, flags);
 
         if (detected == 0)
         {

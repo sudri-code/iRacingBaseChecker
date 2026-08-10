@@ -88,6 +88,7 @@ internal static class WheelSettler
         AxisDef axis,
         int targetPosition,
         int polarity,
+        EffectParameterFlags flags,
         int tolerance = 4000,
         int activeMs = 3000,
         int relaxMs = 1500)
@@ -128,13 +129,13 @@ internal static class WheelSettler
             double command = polarity * (-SpringGain * (position - targetPosition) - DamperGain * velocity);
             force.Magnitude = (int)Math.Clamp(command, -MaxHoldForce, MaxHoldForce);
             p.Parameters = force;
-            effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
+            effect.SetParameters(p, flags);
         }
 
         // ── Фаза 2: отпускаем и ждём, пока руль встанет сам ───────────────────
         force.Magnitude = 0;
         p.Parameters = force;
-        effect.SetParameters(p, EffectParameterFlags.TypeSpecificParameters | EffectParameterFlags.Start);
+        effect.SetParameters(p, flags);
 
         long relaxDeadline = Stopwatch.GetTimestamp() + freq * relaxMs / 1000;
 
